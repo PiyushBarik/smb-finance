@@ -110,16 +110,19 @@ export function ExpensePieChart({ data }: { data: CategoryTotal[] }) {
     <ChartShell height={280}>
       {(width, height) => {
         const outerRadius = Math.max(72, Math.min(104, Math.floor(Math.min(width, height) * 0.36)));
+        const cx = Math.floor(width / 2);
+        const cy = Math.floor(height * 0.46);
         return (
           <PieChart width={width} height={height}>
             <Pie
               data={expenses}
               dataKey="abs"
               nameKey="category"
-              cx="50%"
-              cy="48%"
+              cx={cx}
+              cy={cy}
               outerRadius={outerRadius}
               innerRadius={Math.floor(outerRadius * 0.52)}
+              isAnimationActive={false}
               label={({ category, percentage }) =>
                 Number(percentage) > 6 ? `${String(category).split(" ")[0]} ${Number(percentage).toFixed(0)}%` : ""
               }
@@ -180,7 +183,7 @@ export function ExpenseBarChart({ data }: { data: CategoryTotal[] }) {
               tickLine={false}
             />
             <Tooltip formatter={(v: number) => fmtINR(Number(v))} contentStyle={tooltipStyle} />
-            <Bar dataKey="amount" radius={[0, 4, 4, 0]} maxBarSize={28}>
+            <Bar dataKey="amount" radius={[0, 4, 4, 0]} maxBarSize={28} minPointSize={0}>
               {chartData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
             </Bar>
           </BarChart>
@@ -225,8 +228,8 @@ export function MonthlyTrendChart({ data }: { data: MonthlyPoint[] }) {
           />
           <Tooltip formatter={(v: number) => fmtINR(Number(v))} contentStyle={tooltipStyle} />
           <Legend iconType="circle" iconSize={8} wrapperStyle={{ fontSize: 11, color: "#a1a1aa" }} />
-          <Bar dataKey="income" name="Income" fill="#34d399" radius={[4, 4, 0, 0]} maxBarSize={32} />
-          <Bar dataKey="expenses" name="Expenses" fill="#f87171" radius={[4, 4, 0, 0]} maxBarSize={32} />
+          <Bar dataKey="income" name="Income" fill="#34d399" radius={[4, 4, 0, 0]} maxBarSize={32} minPointSize={0} />
+          <Bar dataKey="expenses" name="Expenses" fill="#f87171" radius={[4, 4, 0, 0]} maxBarSize={32} minPointSize={0} />
           <Line
             type="monotone"
             dataKey="net"

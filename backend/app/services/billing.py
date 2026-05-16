@@ -2,10 +2,10 @@
 Billing service — plan enforcement and Stripe Checkout.
 
 Plans (INR/month):
-  free      ₹0    — 1 org, 500 txns/month, no AI/Excel/email
-  starter   ₹499  — 2 orgs, 5000 txns, AI insights
-  pro       ₹999  — 5 orgs, 25000 txns, AI+Excel+email
-  business  ₹2499 — unlimited orgs, unlimited txns, all features + API
+    free      ₹0    — 1 org, 500 txns/month, no AI/Excel/email
+    starter   ₹499  — 2 orgs, 5000 txns, AI insights
+    pro       ₹999  — 5 orgs, 25000 txns, AI+Excel+email
+    business  ₹2499 — unlimited orgs, unlimited txns, all features + API
 
 Stripe integration is optional — if STRIPE_SECRET_KEY is not set, all plans
 are available in "demo mode" and upgrade/checkout is gracefully skipped.
@@ -144,10 +144,24 @@ def create_checkout_session(
     cancel_url:  str = "http://localhost:3000/billing?cancelled=1",
 ) -> dict:
     if not settings.STRIPE_SECRET_KEY:
+        # Demo mode — actually apply the plan upgrade so owners can test premium features locally
+        plan = db.query(Plan).filter(Plan.name == plan_name).first()
+        if plan:
+            existing_sub = db.query(Subscription).filter(Subscription.user_id == user.id).first()
+            if existing_sub:
+                existing_sub.plan_id = plan.id
+                existing_sub.status = "active"
+                existing_sub.billing_cycle = billing_cycle
+            else:
+                db.add(Subscription(
+                    user_id=user.id, plan_id=plan.id,
+                    status="active", billing_cycle=billing_cycle,
+                ))
+            db.commit()
         return {
             "url": None,
             "demo": True,
-            "message": "Stripe not configured. Add STRIPE_SECRET_KEY to .env to enable payments.",
+            "message": f"Demo mode — upgraded to {plan_name} plan locally. Add STRIPE_SECRET_KEY to .env for real payments.",
         }
 
     import stripe

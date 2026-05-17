@@ -174,3 +174,29 @@ def pass_fee_inference(
     unmatched_src  = [s for s in source if s.id not in matched_src_ids]
     unmatched_bank = [b for b in bank   if b.id not in matched_bank_ids]
     return matches, unmatched_src, unmatched_bank
+
+
+def run_passes(source: List[Any], bank: List[Any]) -> dict:
+    """Orchestrate the 3 passes and return a result dict consumed by the route."""
+    all_matches: List[dict] = []
+    s, b = source, bank
+    by_pass = {1: 0, 2: 0, 3: 0}
+
+    matches_1, s, b = pass_exact(s, b)
+    all_matches.extend(matches_1)
+    by_pass[1] = len(matches_1)
+
+    matches_2, s, b = pass_fuzzy(s, b)
+    all_matches.extend(matches_2)
+    by_pass[2] = len(matches_2)
+
+    matches_3, s, b = pass_fee_inference(s, b)
+    all_matches.extend(matches_3)
+    by_pass[3] = len(matches_3)
+
+    return {
+        "matches":           all_matches,
+        "matches_by_pass":   by_pass,
+        "unmatched_source":  [t.id for t in s],
+        "unmatched_bank":    [t.id for t in b],
+    }

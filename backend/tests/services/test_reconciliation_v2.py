@@ -1,7 +1,7 @@
 from datetime import date
 from types import SimpleNamespace
 
-from app.services.reconciliation_v2 import pass_exact, pass_fuzzy, pass_fee_inference
+from app.services.reconciliation_v2 import pass_exact, pass_fuzzy, pass_fee_inference, run_passes
 
 
 def _txn(id, amount, dt, description=""):
@@ -127,3 +127,29 @@ def test_pass_fee_inference_respects_date_window():
     bank = [_txn(99, 4900, date(2024, 4, 10), "NEFT CR")]   # 9 days away
     matches, _, _ = pass_fee_inference(source, bank)
     assert matches == []
+
+
+def test_run_passes_chains_all_three_passes():
+    source = [
+        # pass 1 hit
+        _txn(1, -5000, date(2024, 4, 5), "Google Ads"),
+        # pass 2 hit (off by 1%)
+        _txn(2, -10000, date(2024, 4, 6), "AWS Invoice March"),
+        # pass 3 group
+        _txn(3, 4000, date(2024, 4, 8), "Order A"),
+        _txn(4, 3000, date(2024, 4, 8), "Order B"),
+        _txn(5, -100, date(2024, 4, 8), "Shopify fee"),
+        # leftover
+        _txn(6, -777, date(2024, 4, 9), "Random"),
+    ]
+    bank = [
+        _txn(11, 5000,  date(2024, 4, 5), "GOOGLE ADS"),
+        _txn(12, 10100, date(2024, 4, 6), "AWS INVOICE"),
+        _txn(13, 6900,  date(2024, 4, 9), "NEFT CR SHOPIFY PAYMENTS"),
+    ]
+    result = run_passes(source, bank)
+
+    assert result["matches_by_pass"] == {1: 1, 2: 1, 3: 3}
+    assert result["unmatched_source"] == [6]
+    assert result["unmatched_bank"]   == []
+    assert len(result["matches"]) == 5

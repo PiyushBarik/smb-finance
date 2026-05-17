@@ -76,3 +76,35 @@ def test_payout_cadence_gap_silent_when_on_time():
     ]
     anomalies = payout_cadence_gap(payouts, as_of=date(2024, 4, 24))
     assert anomalies == []
+
+
+from app.services.anomaly import duplicate_within_window
+
+
+def test_duplicate_flags_same_amount_same_vendor_within_7_days():
+    txns = [
+        _txn(1, -15000, date(2024, 4, 16), "Google Ads"),
+        _txn(2, -15000, date(2024, 4, 17), "Google Ads"),
+    ]
+    anomalies = duplicate_within_window(txns)
+    assert len(anomalies) == 1
+    assert anomalies[0]["detail"]["amount"] == 15000.0
+    assert set(anomalies[0]["transaction_ids"]) == {1, 2}
+
+
+def test_duplicate_ignores_outside_window():
+    txns = [
+        _txn(1, -15000, date(2024, 4, 1), "Google Ads"),
+        _txn(2, -15000, date(2024, 4, 10), "Google Ads"),
+    ]
+    anomalies = duplicate_within_window(txns)
+    assert anomalies == []
+
+
+def test_duplicate_ignores_different_vendor():
+    txns = [
+        _txn(1, -15000, date(2024, 4, 1), "Google Ads"),
+        _txn(2, -15000, date(2024, 4, 2), "Salary Jane"),
+    ]
+    anomalies = duplicate_within_window(txns)
+    assert anomalies == []

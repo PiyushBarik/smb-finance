@@ -150,3 +150,40 @@ def payout_cadence_gap(
             "cadence":             cadence,
         },
     }]
+
+
+def duplicate_within_window(
+    transactions: list[Any],
+    window_days: int = 7,
+) -> list[dict]:
+    """Same abs(amount) + same vendor cluster + within window_days = possible double charge."""
+    anomalies: list[dict] = []
+    seen_pairs: set[tuple[int, int]] = set()
+
+    for i, t1 in enumerate(transactions):
+        if t1.amount >= 0 or not t1.date:
+            continue
+        for t2 in transactions[i+1:]:
+            if t2.amount >= 0 or not t2.date:
+                continue
+            if abs(t1.amount) != abs(t2.amount):
+                continue
+            if abs((t1.date - t2.date).days) > window_days:
+                continue
+            if _vendor_key(t1.description) != _vendor_key(t2.description):
+                continue
+            pair = (min(t1.id, t2.id), max(t1.id, t2.id))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            anomalies.append({
+                "rule_id":         "duplicate_within_window",
+                "severity":        "medium",
+                "transaction_ids": [t1.id, t2.id],
+                "detail": {
+                    "amount":      abs(t1.amount),
+                    "vendor":      _vendor_key(t1.description),
+                    "days_apart":  abs((t1.date - t2.date).days),
+                },
+            })
+    return anomalies

@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Nav from "@/components/Nav";
 import OrgSelector, { Org } from "@/components/OrgSelector";
@@ -7,36 +7,50 @@ import { useToast } from "@/components/Toast";
 import {
   RunDetail, RunSummary, MatchRow, AnomalyRow,
   startRun, listRuns, getRun, scanAnomalies,
+  patchMatch, patchAnomaly,
 } from "@/lib/reconcile";
 import { apiFetch } from "@/lib/api";
 import { LoadingState, EmptyState, ErrorState } from "@/components/reconcile/states";
-import { MatchCard } from "@/components/reconcile/MatchCard";
-import { AnomalyCard } from "@/components/reconcile/AnomalyCard";
-import { TriageColumn } from "@/components/reconcile/TriageColumn";
-import { RunHistoryStrip } from "@/components/reconcile/RunHistoryStrip";
-import { DrilldownDrawer } from "@/components/reconcile/DrilldownDrawer";
-import { Loader2, Play } from "lucide-react";
+import { InboxRow, InboxItem } from "@/components/reconcile/InboxRow";
+import { DetailPane } from "@/components/reconcile/DetailPane";
+import {
+  Loader2, Play, Search, Inbox, CheckCircle2, XCircle, Sparkles,
+} from "lucide-react";
 
 interface Batch { id: number; filename: string; source: string; row_count: number; }
+
+type Segment = "triage" | "auto" | "accepted" | "dismissed";
+
+const SEGMENTS: Array<{
+  id: Segment; label: string; icon: React.ComponentType<{ size?: number; style?: React.CSSProperties }>;
+}> = [
+  { id: "triage",    label: "Triage",       icon: Inbox },
+  { id: "auto",      label: "Auto-matched", icon: Sparkles },
+  { id: "accepted",  label: "Accepted",     icon: CheckCircle2 },
+  { id: "dismissed", label: "Dismissed",    icon: XCircle },
+];
 
 export default function ReconcilePage() {
   const router = useRouter();
   const { toast } = useToast();
 
-  const [org, setOrg] = useState<Org | null>(null);
-  const [batches, setBatches] = useState<Batch[]>([]);
+  const [org, setOrg]                 = useState<Org | null>(null);
+  const [batches, setBatches]         = useState<Batch[]>([]);
   const [sourceBatchId, setSourceBatchId] = useState<number | null>(null);
   const [bankBatchId, setBankBatchId] = useState<number | null>(null);
 
-  const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [currentRun, setCurrentRun] = useState<RunDetail | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [starting, setStarting] = useState(false);
+  const [runs, setRuns]               = useState<RunSummary[]>([]);
+  const [currentRun, setCurrentRun]   = useState<RunDetail | null>(null);
+  const [loading, setLoading]         = useState(false);
+  const [error, setError]             = useState<string | null>(null);
+  const [starting, setStarting]       = useState(false);
 
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [drawerKind, setDrawerKind] = useState<"match" | "anomaly" | null>(null);
-  const [drawerData, setDrawerData] = useState<MatchRow | AnomalyRow | null>(null);
+  // UI state
+  const [segment, setSegment]         = useState<Segment>("triage");
+  const [search, setSearch]           = useState("");
+  const [selectedId, setSelectedId]   = useState<string | null>(null);   // "match-12" or "anomaly-7"
+  const [checkedIds, setCheckedIds]   = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy]       = useState(false);
 
   useEffect(() => {
     if (!localStorage.getItem("smb_token")) { router.push("/login"); return; }
@@ -79,19 +93,6 @@ export default function ReconcilePage() {
     }
   }
 
-  async function handleSelectRun(runId: number) {
-    if (!org) return;
-    setLoading(true);
-    try {
-      const detail = await getRun(org.id, runId);
-      setCurrentRun(detail);
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Failed to load run");
-    } finally {
-      setLoading(false);
-    }
-  }
-
   async function handleScan() {
     if (!org) return;
     try {
@@ -103,165 +104,488 @@ export default function ReconcilePage() {
     }
   }
 
-  function updateMatch(updated: MatchRow) {
-    setCurrentRun(r => r ? { ...r, matches: r.matches.map(m => m.id === updated.id ? updated : m) } : r);
+  // ── Normalise matches + anomalies into a single inbox list ─────────────────
+  const allItems: InboxItem[] = useMemo(() => {
+    if (!currentRun) return [];
+    return [
+      ...currentRun.matches.map<InboxItem>(m => ({ kind: "match", data: m })),
+      ...currentRun.anomalies.map<InboxItem>(a => ({ kind: "anomaly", data: a })),
+    ];
+  }, [currentRun]);
+
+  // ── Per-segment filter ─────────────────────────────────────────────────────
+  function inSegment(item: InboxItem, seg: Segment): boolean {
+    if (seg === "triage") {
+      if (item.kind === "anomaly") return item.data.status === "open";
+      return item.data.status === "pending" && item.data.confidence !== "high";
+    }
+    if (seg === "auto") {
+      if (item.kind === "anomaly") return false;
+      return item.data.status === "pending" && item.data.confidence === "high";
+    }
+    if (seg === "accepted") return item.data.status === "accepted";
+    if (seg === "dismissed") {
+      return item.kind === "anomaly"
+        ? item.data.status === "dismissed" || item.data.status === "snoozed"
+        : item.data.status === "rejected";
+    }
+    return false;
   }
 
-  function updateAnomaly(updated: AnomalyRow) {
-    setCurrentRun(r => r ? { ...r, anomalies: r.anomalies.map(a => a.id === updated.id ? updated : a) } : r);
+  const counts = useMemo(() => {
+    const c: Record<Segment, number> = { triage: 0, auto: 0, accepted: 0, dismissed: 0 };
+    for (const it of allItems) {
+      for (const s of SEGMENTS) if (inSegment(it, s.id)) c[s.id]++;
+    }
+    return c;
+  }, [allItems]);
+
+  // ── Search filter ─────────────────────────────────────────────────────────
+  function matchesSearch(item: InboxItem, q: string): boolean {
+    if (!q) return true;
+    const needle = q.toLowerCase();
+    if (item.kind === "anomaly") {
+      const a = item.data;
+      return [a.rule_id, a.explanation, JSON.stringify(a.detail)]
+        .filter(Boolean).join(" ").toLowerCase().includes(needle);
+    }
+    return (item.data.explanation ?? "").toLowerCase().includes(needle);
   }
 
-  function openDrilldown(kind: "match" | "anomaly", id: number) {
-    if (!currentRun) return;
-    const data = kind === "match"
-      ? currentRun.matches.find(m => m.id === id) ?? null
-      : currentRun.anomalies.find(a => a.id === id) ?? null;
-    setDrawerKind(kind);
-    setDrawerData(data);
-    setDrawerOpen(true);
+  // ── Sort: anomalies > low-conf matches > high-conf matches, then date desc ─
+  function priority(item: InboxItem): number {
+    if (item.kind === "anomaly") {
+      return item.data.severity === "high"   ? 100
+           : item.data.severity === "medium" ? 60
+           :                                   30;
+    }
+    return item.data.confidence === "high"   ? 5
+         : item.data.confidence === "medium" ? 40
+         :                                     50;
   }
 
-  const matches = currentRun?.matches ?? [];
-  const anomalies = currentRun?.anomalies ?? [];
+  const visibleItems = useMemo(() => {
+    return allItems
+      .filter(it => inSegment(it, segment))
+      .filter(it => matchesSearch(it, search))
+      .sort((a, b) => {
+        const p = priority(b) - priority(a);
+        if (p !== 0) return p;
+        const da = a.kind === "anomaly" ? a.data.detected_at : a.data.updated_at;
+        const db = b.kind === "anomaly" ? b.data.detected_at : b.data.updated_at;
+        return new Date(db).getTime() - new Date(da).getTime();
+      });
+  }, [allItems, segment, search]);
 
-  const accepted   = matches.filter(m => m.status === "accepted");
-  const pending    = matches.filter(m => m.status === "pending" && m.confidence === "high");
-  const reviewable = matches.filter(m => m.status === "pending" && m.confidence !== "high");
-  const openAnomalies = anomalies.filter(a => a.status === "open");
+  const idOf = (it: InboxItem) => `${it.kind}-${it.data.id}`;
+  const selectedItem = useMemo(
+    () => allItems.find(it => idOf(it) === selectedId) ?? null,
+    [allItems, selectedId],
+  );
+
+  function updateInState(updated: MatchRow | AnomalyRow) {
+    setCurrentRun(r => {
+      if (!r) return r;
+      if ("rule_id" in updated) {
+        return { ...r, anomalies: r.anomalies.map(a => a.id === updated.id ? updated : a) };
+      }
+      return { ...r, matches: r.matches.map(m => m.id === updated.id ? updated : m) };
+    });
+  }
+
+  // ── Selection ─────────────────────────────────────────────────────────────
+  function toggleCheck(id: string) {
+    setCheckedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function checkAllVisible() {
+    setCheckedIds(prev => {
+      const next = new Set(prev);
+      visibleItems.forEach(it => next.add(idOf(it)));
+      return next;
+    });
+  }
+
+  function clearChecks() { setCheckedIds(new Set()); }
+
+  // ── Bulk operations ───────────────────────────────────────────────────────
+  async function bulk(action: "accept" | "dismiss") {
+    if (checkedIds.size === 0) return;
+    setBulkBusy(true);
+    const targets = visibleItems.filter(it => checkedIds.has(idOf(it)));
+    const ops = targets.map(it => {
+      if (it.kind === "match") {
+        return patchMatch(it.data.id, action === "accept" ? "accepted" : "rejected");
+      }
+      return patchAnomaly(it.data.id, action === "accept" ? "accepted" : "dismissed");
+    });
+    try {
+      const updates = await Promise.allSettled(ops);
+      const ok = updates.filter(u => u.status === "fulfilled").length;
+      const fail = updates.length - ok;
+      updates.forEach(u => { if (u.status === "fulfilled") updateInState(u.value); });
+      clearChecks();
+      toast(`${ok} ${action}ed${fail ? ` · ${fail} failed` : ""}`, fail ? "error" : "success");
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  if (!org) {
+    return (
+      <div style={pageStyle}>
+        <FontImport />
+        <Nav />
+        <div style={{ maxWidth: 1280, margin: "0 auto", padding: "36px 24px" }}>
+          <Header onSelectOrg={setOrg} org={null} />
+          <EmptyState title="Pick an organisation" subtitle="Select one above to view reconciliations." />
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div style={{ minHeight: "100vh", background: "#0a0e1a", color: "#f8fafc",
-      fontFamily: "'Manrope', system-ui, sans-serif" }}>
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');`}</style>
+    <div style={pageStyle}>
+      <FontImport />
       <Nav />
 
-      <div style={{ maxWidth: 1280, margin: "0 auto", padding: "36px 24px 60px" }}>
-        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between",
-          flexWrap: "wrap", gap: 16, marginBottom: 28 }}>
-          <div>
-            <h1 style={{ fontFamily: "'Instrument Serif', Georgia, serif", fontSize: 36,
-              margin: "0 0 6px", lineHeight: 1 }}>
-              Reconcile <em style={{ color: "#475569" }}>triage</em>
-            </h1>
-            <p style={{ fontSize: 13, color: "#475569" }}>
-              Match Shopify payouts to bank credits, review anomalies, take action.
-            </p>
-          </div>
-          <OrgSelector selected={org} onSelect={setOrg} />
+      <div style={{ maxWidth: 1440, margin: "0 auto", padding: "28px 24px 60px" }}>
+        <Header onSelectOrg={setOrg} org={org} />
+
+        {/* Run-start form */}
+        <div style={{
+          padding: 14, borderRadius: 12,
+          border: "1px solid rgba(30,41,59,0.6)",
+          background: "rgba(15,23,42,0.4)",
+          display: "flex", alignItems: "center", gap: 10,
+          flexWrap: "wrap", marginBottom: 22,
+        }}>
+          <select value={sourceBatchId ?? ""} onChange={e => setSourceBatchId(Number(e.target.value) || null)} style={selectStyle}>
+            <option value="">Source batch (Shopify…)</option>
+            {batches.filter(b => b.source !== "bank").map(b => (
+              <option key={b.id} value={b.id}>{b.filename} ({b.row_count} rows)</option>
+            ))}
+          </select>
+          <select value={bankBatchId ?? ""} onChange={e => setBankBatchId(Number(e.target.value) || null)} style={selectStyle}>
+            <option value="">Bank batch</option>
+            {batches.filter(b => b.source === "bank").map(b => (
+              <option key={b.id} value={b.id}>{b.filename} ({b.row_count} rows)</option>
+            ))}
+          </select>
+          <button onClick={handleStart} disabled={!sourceBatchId || !bankBatchId || starting} style={primaryBtn(starting)}>
+            {starting ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+            Run reconciliation
+          </button>
+          <button onClick={handleScan} style={ghostBtn}>Rescan anomalies</button>
+          {runs.length > 0 && (
+            <span style={{
+              marginLeft: "auto",
+              fontFamily: "'JetBrains Mono', monospace", fontSize: 10,
+              letterSpacing: "0.14em", textTransform: "uppercase", color: "#475569",
+            }}>
+              {runs.length} run{runs.length !== 1 ? "s" : ""} · latest #{runs[0]?.id}
+            </span>
+          )}
         </div>
 
-        {!org ? (
-          <EmptyState title="Pick an organisation" subtitle="Select one above to view reconciliations." />
-        ) : (
-          <>
-            {/* Run-start form */}
-            <div style={{
-              padding: 18, borderRadius: 14,
-              border: "1px solid rgba(30,41,59,0.7)",
-              background: "rgba(15,23,42,0.4)",
-              display: "flex", alignItems: "center", gap: 12,
-              flexWrap: "wrap", marginBottom: 24,
-            }}>
-              <select
-                value={sourceBatchId ?? ""}
-                onChange={e => setSourceBatchId(Number(e.target.value) || null)}
-                style={selectStyle}
-              >
-                <option value="">Source batch (Shopify…)</option>
-                {batches.filter(b => b.source !== "bank").map(b => (
-                  <option key={b.id} value={b.id}>{b.filename} ({b.row_count} rows)</option>
-                ))}
-              </select>
-              <select
-                value={bankBatchId ?? ""}
-                onChange={e => setBankBatchId(Number(e.target.value) || null)}
-                style={selectStyle}
-              >
-                <option value="">Bank batch</option>
-                {batches.filter(b => b.source === "bank").map(b => (
-                  <option key={b.id} value={b.id}>{b.filename} ({b.row_count} rows)</option>
-                ))}
-              </select>
-              <button
-                onClick={handleStart}
-                disabled={!sourceBatchId || !bankBatchId || starting}
-                style={primaryBtn(starting)}
-              >
-                {starting ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
-                Run reconciliation
-              </button>
-              <button onClick={handleScan} style={ghostBtn}>
-                Rescan anomalies
-              </button>
+        {loading && <LoadingState />}
+        {error && <ErrorState message={error} onRetry={() => org && refreshRuns(org.id)} />}
+
+        {!loading && !error && !currentRun && (
+          <EmptyState title="No reconciliations yet" subtitle="Start one above to begin." />
+        )}
+
+        {!loading && !error && currentRun && (
+          <div style={{
+            display: "grid",
+            gridTemplateColumns: "172px 1fr auto",
+            border: "1px solid rgba(30,41,59,0.55)",
+            borderRadius: 14,
+            background: "rgba(10,14,26,0.7)",
+            overflow: "hidden",
+            minHeight: 580,
+          }}>
+            <SegmentRail
+              segment={segment}
+              onSelect={s => { setSegment(s); clearChecks(); setSelectedId(null); }}
+              counts={counts}
+            />
+
+            <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
+              <Banner segment={segment} count={visibleItems.length} totalTriage={counts.triage} />
+              <Toolbar
+                search={search}
+                onSearch={setSearch}
+                selectedCount={checkedIds.size}
+                visibleCount={visibleItems.length}
+                onCheckAll={checkAllVisible}
+                onClear={clearChecks}
+                onBulkAccept={() => bulk("accept")}
+                onBulkDismiss={() => bulk("dismiss")}
+                bulkBusy={bulkBusy}
+              />
+              <div style={{ overflowY: "auto", maxHeight: "70vh" }}>
+                {visibleItems.length === 0
+                  ? <div style={{ padding: 60 }}><EmptyState title={emptyTitleFor(segment)} /></div>
+                  : visibleItems.map((it, i) => (
+                      <InboxRow
+                        key={idOf(it) + "-" + i}
+                        item={it}
+                        selected={idOf(it) === selectedId}
+                        checked={checkedIds.has(idOf(it))}
+                        onClick={() => setSelectedId(idOf(it))}
+                        onToggleCheck={() => toggleCheck(idOf(it))}
+                      />
+                    ))}
+              </div>
             </div>
 
-            <RunHistoryStrip runs={runs} selectedRunId={currentRun?.id ?? null} onSelect={handleSelectRun} />
-
-            {loading && <LoadingState />}
-            {error && <ErrorState message={error} onRetry={() => org && refreshRuns(org.id)} />}
-
-            {!loading && !error && !currentRun && (
-              <EmptyState title="No reconciliations yet" subtitle="Start one above to begin." />
-            )}
-
-            {!loading && !error && currentRun && (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 24 }}>
-                <TriageColumn title="Auto-matched" count={accepted.length + pending.length} accent="emerald" defaultCollapsed>
-                  {[...pending, ...accepted].map(m => (
-                    <MatchCard key={m.id} match={m} onChange={updateMatch}
-                      onOpenDrilldown={id => openDrilldown("match", id)} />
-                  ))}
-                </TriageColumn>
-
-                <TriageColumn title="Needs review" count={reviewable.length} accent="amber">
-                  {reviewable.length === 0
-                    ? <EmptyState title="Nothing to review" />
-                    : reviewable.map(m => (
-                        <MatchCard key={m.id} match={m} onChange={updateMatch}
-                          onOpenDrilldown={id => openDrilldown("match", id)} />
-                      ))}
-                </TriageColumn>
-
-                <TriageColumn title="Anomalies" count={openAnomalies.length} accent="rose">
-                  {openAnomalies.length === 0
-                    ? <EmptyState title="No open anomalies" />
-                    : openAnomalies.map(a => (
-                        <AnomalyCard key={a.id} anomaly={a} onChange={updateAnomaly}
-                          onOpenDrilldown={id => openDrilldown("anomaly", id)} />
-                      ))}
-                </TriageColumn>
-              </div>
-            )}
-          </>
+            <DetailPane
+              item={selectedItem}
+              onClose={() => setSelectedId(null)}
+              onChange={updateInState}
+            />
+          </div>
         )}
       </div>
-
-      <DrilldownDrawer
-        open={drawerOpen}
-        onClose={() => setDrawerOpen(false)}
-        kind={drawerKind}
-        data={drawerData}
-      />
     </div>
   );
 }
 
+/* ───────── sub-components ───────── */
+
+function Header({ org, onSelectOrg }: { org: Org | null; onSelectOrg: (o: Org | null) => void }) {
+  return (
+    <div style={{
+      display: "flex", alignItems: "flex-start", justifyContent: "space-between",
+      flexWrap: "wrap", gap: 16, marginBottom: 22,
+    }}>
+      <div>
+        <h1 style={{
+          fontFamily: "'Instrument Serif', Georgia, serif",
+          fontSize: 38, margin: "0 0 6px", lineHeight: 1, color: "#f8fafc",
+        }}>
+          Reconcile <em style={{ color: "#475569" }}>triage</em>
+        </h1>
+        <p style={{ fontSize: 13, color: "#475569" }}>
+          Match Shopify payouts to bank credits, review anomalies, take action.
+        </p>
+      </div>
+      <OrgSelector selected={org} onSelect={onSelectOrg} />
+    </div>
+  );
+}
+
+function Banner({ segment, count, totalTriage }: { segment: Segment; count: number; totalTriage: number }) {
+  const headline =
+    segment === "triage"    ? `${totalTriage} ${totalTriage === 1 ? "item wants" : "items want"} your attention`
+  : segment === "auto"      ? `${count} ${count === 1 ? "match was" : "matches were"} auto-matched with high confidence`
+  : segment === "accepted"  ? `${count} ${count === 1 ? "item" : "items"} accepted`
+  :                           `${count} ${count === 1 ? "item" : "items"} dismissed`;
+
+  return (
+    <div style={{ padding: "20px 22px 14px", borderBottom: "1px solid rgba(30,41,59,0.5)" }}>
+      <div style={{
+        fontFamily: "'JetBrains Mono', monospace",
+        fontSize: 10, letterSpacing: "0.18em", textTransform: "uppercase",
+        color: "#52525b", marginBottom: 6,
+      }}>
+        {segment}
+      </div>
+      <div style={{
+        fontFamily: "'Instrument Serif', Georgia, serif",
+        fontSize: 24, fontStyle: "italic", color: "#e2e8f0",
+        lineHeight: 1.2,
+      }}>
+        {headline}
+      </div>
+    </div>
+  );
+}
+
+function SegmentRail({
+  segment, onSelect, counts,
+}: {
+  segment: Segment;
+  onSelect: (s: Segment) => void;
+  counts: Record<Segment, number>;
+}) {
+  return (
+    <nav style={{
+      borderRight: "1px solid rgba(30,41,59,0.55)",
+      padding: "20px 0",
+      display: "flex", flexDirection: "column", gap: 4,
+      background: "rgba(15,23,42,0.4)",
+    }}>
+      {SEGMENTS.map(({ id, label, icon: Icon }) => {
+        const active = segment === id;
+        return (
+          <button key={id} onClick={() => onSelect(id)} style={{
+            position: "relative",
+            display: "flex", alignItems: "center", gap: 10,
+            padding: "9px 18px 9px 22px",
+            border: "none", background: "transparent",
+            color: active ? "#f1f5f9" : "#64748b",
+            fontFamily: "'Manrope', system-ui, sans-serif",
+            fontSize: 13, fontWeight: active ? 600 : 500,
+            cursor: "pointer", textAlign: "left",
+            transition: "color 120ms",
+          }}
+            onMouseEnter={e => { if (!active) e.currentTarget.style.color = "#cbd5e1"; }}
+            onMouseLeave={e => { if (!active) e.currentTarget.style.color = "#64748b"; }}
+          >
+            {active && (
+              <span style={{
+                position: "absolute", left: 0, top: 8, bottom: 8, width: 2,
+                background: "#34d399", borderRadius: "0 2px 2px 0",
+              }} />
+            )}
+            <Icon size={13} style={{ color: active ? "#34d399" : "#475569" }} />
+            <span style={{ flex: 1 }}>{label}</span>
+            <span style={{
+              fontFamily: "'JetBrains Mono', monospace", fontSize: 10,
+              color: active ? "#34d399" : "#475569",
+              fontVariantNumeric: "tabular-nums",
+            }}>
+              {counts[id]}
+            </span>
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
+function Toolbar({
+  search, onSearch,
+  selectedCount, visibleCount,
+  onCheckAll, onClear,
+  onBulkAccept, onBulkDismiss, bulkBusy,
+}: {
+  search: string;
+  onSearch: (s: string) => void;
+  selectedCount: number;
+  visibleCount: number;
+  onCheckAll: () => void;
+  onClear: () => void;
+  onBulkAccept: () => void;
+  onBulkDismiss: () => void;
+  bulkBusy: boolean;
+}) {
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 10,
+      padding: "10px 18px",
+      borderBottom: "1px solid rgba(30,41,59,0.45)",
+    }}>
+      <div style={{
+        display: "flex", alignItems: "center", gap: 8, flex: 1, maxWidth: 360,
+        padding: "6px 10px", borderRadius: 8,
+        border: "1px solid rgba(30,41,59,0.6)",
+        background: "rgba(15,23,42,0.6)",
+      }}>
+        <Search size={13} style={{ color: "#475569" }} />
+        <input
+          value={search}
+          onChange={e => onSearch(e.target.value)}
+          placeholder="Search vendor, explanation, evidence…"
+          style={{
+            flex: 1, border: "none", outline: "none", background: "transparent",
+            color: "#e2e8f0", fontSize: 12.5,
+            fontFamily: "'Manrope', system-ui, sans-serif",
+          }}
+        />
+      </div>
+
+      <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+        {selectedCount > 0 ? (
+          <>
+            <span style={{
+              fontFamily: "'JetBrains Mono', monospace",
+              fontSize: 10, letterSpacing: "0.14em", textTransform: "uppercase",
+              color: "#34d399", marginRight: 4,
+            }}>
+              {selectedCount} selected
+            </span>
+            <button onClick={onBulkAccept} disabled={bulkBusy} style={smallBtn("emerald")}>
+              {bulkBusy ? <Loader2 size={11} className="animate-spin" /> : <CheckCircle2 size={11} />}
+              Accept
+            </button>
+            <button onClick={onBulkDismiss} disabled={bulkBusy} style={smallBtn("rose")}>
+              {bulkBusy ? <Loader2 size={11} className="animate-spin" /> : <XCircle size={11} />}
+              Dismiss
+            </button>
+            <button onClick={onClear} style={smallBtn("slate")}>Clear</button>
+          </>
+        ) : (
+          <button onClick={onCheckAll} style={smallBtn("slate")}>
+            Select all ({visibleCount})
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ───────── styles & helpers ───────── */
+
+const pageStyle: React.CSSProperties = {
+  minHeight: "100vh",
+  background: "#0a0e1a",
+  color: "#f8fafc",
+  fontFamily: "'Manrope', system-ui, sans-serif",
+};
+
+function FontImport() {
+  return (
+    <style>{`@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');`}</style>
+  );
+}
+
 const selectStyle: React.CSSProperties = {
-  padding: "8px 12px", borderRadius: 8,
+  padding: "7px 10px", borderRadius: 7,
   border: "1px solid rgba(30,41,59,0.8)",
   background: "rgba(15,23,42,0.7)", color: "#e2e8f0",
-  fontSize: 13, fontFamily: "inherit", minWidth: 220,
+  fontSize: 12.5, fontFamily: "inherit", minWidth: 220,
 };
 
 const primaryBtn = (busy: boolean): React.CSSProperties => ({
   display: "flex", alignItems: "center", gap: 6,
-  padding: "8px 14px", borderRadius: 8, border: "none", cursor: busy ? "wait" : "pointer",
-  background: "#34d399", color: "#0f172a", fontSize: 13, fontWeight: 700,
-  fontFamily: "inherit", opacity: busy ? 0.6 : 1,
+  padding: "7px 13px", borderRadius: 7, border: "none",
+  cursor: busy ? "wait" : "pointer",
+  background: "#34d399", color: "#0f172a",
+  fontSize: 12.5, fontWeight: 700, fontFamily: "inherit",
+  opacity: busy ? 0.6 : 1,
 });
 
 const ghostBtn: React.CSSProperties = {
-  padding: "8px 14px", borderRadius: 8,
+  padding: "7px 13px", borderRadius: 7,
   border: "1px solid rgba(30,41,59,0.8)", background: "transparent",
   color: "#94a3b8", fontSize: 12, cursor: "pointer", fontFamily: "inherit",
 };
+
+function smallBtn(tone: "emerald" | "rose" | "slate"): React.CSSProperties {
+  const colors = {
+    emerald: { border: "rgba(52,211,153,0.4)",  text: "#6ee7b7" },
+    rose:    { border: "rgba(251,113,133,0.4)", text: "#fda4af" },
+    slate:   { border: "rgba(148,163,184,0.3)", text: "#cbd5e1" },
+  }[tone];
+  return {
+    display: "flex", alignItems: "center", gap: 5,
+    padding: "5px 10px", borderRadius: 6,
+    border: `1px solid ${colors.border}`, background: "transparent",
+    color: colors.text, fontSize: 11.5, cursor: "pointer",
+    fontFamily: "'Manrope', system-ui, sans-serif",
+  };
+}
+
+function emptyTitleFor(segment: Segment): string {
+  return segment === "triage"    ? "Nothing needs your attention"
+       : segment === "auto"      ? "No auto-matched items"
+       : segment === "accepted"  ? "Nothing accepted yet"
+       :                            "Nothing dismissed yet";
+}

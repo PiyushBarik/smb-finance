@@ -124,7 +124,7 @@ def _contains_fee(txns: List[Any]) -> bool:
 def pass_fee_inference(
     source: List[Any],
     bank: List[Any],
-    max_subset_size: int = 8,
+    max_subset_size: int = 5,
 ) -> Tuple[List[dict], List[Any], List[Any]]:
     """Pass 3: a single bank credit ≈ sum of N source line-items minus a fee row.
 
@@ -133,6 +133,11 @@ def pass_fee_inference(
       all S.date within ±2 days of b.date
       S contains at least one fee-flavoured row
     Bounded to subset size <= max_subset_size.
+
+    Optimisation: the search space is restricted to subsets that include at
+    least one fee-flavoured row. We iterate fee rows × combinations(non-fee
+    rows, k-1) instead of the full C(N, k) — orders of magnitude smaller
+    when most candidates aren't fees.
     """
     matches: List[dict] = []
     matched_src_ids: set[int] = set()
@@ -146,14 +151,31 @@ def pass_fee_inference(
             if s.id not in matched_src_ids
             and abs((s.date - b.date).days) <= 2
         ]
+        # Split candidates into fee-flavoured and non-fee rows up front.
+        # If there are no fee rows, pass 3 cannot match this credit — skip.
+        fee_rows     = [s for s in candidate_src if _contains_fee([s])]
+        non_fee_rows = [s for s in candidate_src if not _contains_fee([s])]
+        if not fee_rows:
+            continue
+
         tolerance = max(5.0, b.amount * 0.005)
         found_subset: list[Any] | None = None
 
+        # For each subset size k (2..max), pick one fee row and combine it
+        # with k-1 non-fee rows. This is C(F, 1) * C(N-F, k-1), which is much
+        # smaller than C(N, k) when fees are rare.
         for size in range(2, min(max_subset_size, len(candidate_src)) + 1):
-            for combo in combinations(candidate_src, size):
-                total = sum(t.amount for t in combo)
-                if abs(total - b.amount) <= tolerance and _contains_fee(list(combo)):
-                    found_subset = list(combo)
+            for fee in fee_rows:
+                others_needed = size - 1
+                if others_needed > len(non_fee_rows):
+                    continue
+                for others in combinations(non_fee_rows, others_needed):
+                    combo = (fee,) + others
+                    total = sum(t.amount for t in combo)
+                    if abs(total - b.amount) <= tolerance:
+                        found_subset = list(combo)
+                        break
+                if found_subset:
                     break
             if found_subset:
                 break

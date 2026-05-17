@@ -2,7 +2,7 @@ import json
 from datetime import date
 from types import SimpleNamespace
 
-from app.services.anomaly import vendor_spike
+from app.services.anomaly import vendor_spike, payout_cadence_gap
 
 
 def _txn(id, amount, dt, description=""):
@@ -43,4 +43,36 @@ def test_vendor_spike_ignores_within_normal_range():
     txns = [_txn(i, -10000, date(2024, m, 15), "Google Ads")
             for i, m in enumerate(range(1, 5), 1)]
     anomalies = vendor_spike(txns, current_month=date(2024, 4, 1))
+    assert anomalies == []
+
+
+def _payout(id, amount, dt):
+    return SimpleNamespace(id=id, amount=amount, date=dt,
+                           description="NEFT CR SHOPIFY PAYMENTS", category="Income / Revenue")
+
+
+def test_payout_cadence_gap_flags_missing_weekly_payout():
+    # 4 weekly payouts, then a 14-day gap
+    payouts = [
+        _payout(1, 30000, date(2024, 4, 1)),
+        _payout(2, 32000, date(2024, 4, 8)),
+        _payout(3, 28000, date(2024, 4, 15)),
+        _payout(4, 31000, date(2024, 4, 22)),
+        # Expected next payout ~ Apr 29; nothing till May 6
+    ]
+    anomalies = payout_cadence_gap(payouts, as_of=date(2024, 5, 5))
+    assert len(anomalies) == 1
+    detail = anomalies[0]["detail"]
+    assert detail["days_late"] >= 3
+    assert detail["cadence"] == 7
+
+
+def test_payout_cadence_gap_silent_when_on_time():
+    payouts = [
+        _payout(1, 30000, date(2024, 4, 1)),
+        _payout(2, 30000, date(2024, 4, 8)),
+        _payout(3, 30000, date(2024, 4, 15)),
+        _payout(4, 30000, date(2024, 4, 22)),
+    ]
+    anomalies = payout_cadence_gap(payouts, as_of=date(2024, 4, 24))
     assert anomalies == []

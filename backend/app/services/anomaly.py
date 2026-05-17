@@ -103,3 +103,50 @@ def evidence_hash(anomaly: dict) -> str:
     return hashlib.sha256(
         f"{anomaly['rule_id']}:{txn_ids}:{detail_str}".encode()
     ).hexdigest()
+
+
+_PAYOUT_PATTERN = re.compile(r"\b(payout|settlement|shopify.*payments?)\b", re.IGNORECASE)
+
+
+def payout_cadence_gap(
+    transactions: list[Any],
+    as_of: date,
+) -> list[dict]:
+    """Detect Shopify-style payout cadence breaks.
+
+    Filter to positive 'payout-like' txns, infer cadence as median day-gap,
+    flag if as_of - last_payout >= cadence + 3.
+    """
+    payouts = [
+        t for t in transactions
+        if t.amount > 0
+        and t.date
+        and t.description
+        and _PAYOUT_PATTERN.search(t.description)
+    ]
+    if len(payouts) < 3:
+        return []
+
+    payouts.sort(key=lambda t: t.date)
+    gaps = [(payouts[i].date - payouts[i-1].date).days for i in range(1, len(payouts))]
+    cadence = int(statistics.median(gaps))
+    if cadence < 1:
+        return []
+
+    last = payouts[-1]
+    days_since = (as_of - last.date).days
+    if days_since < cadence + 3:
+        return []
+
+    expected = last.date + timedelta(days=cadence)
+    return [{
+        "rule_id":         "payout_cadence_gap",
+        "severity":        "high",
+        "transaction_ids": [last.id],
+        "detail": {
+            "expected_date":       expected.isoformat(),
+            "days_late":           days_since - cadence,
+            "last_payout_amount":  last.amount,
+            "cadence":             cadence,
+        },
+    }]

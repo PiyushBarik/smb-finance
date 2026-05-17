@@ -28,6 +28,9 @@ dist/
 *.sqlite
 *.sqlite3
 smb_finance.db
+# SQLite WAL/SHM sidecars (created when journal_mode=WAL)
+*.db-wal
+*.db-shm
 
 # ── Testing / coverage ───────────────────────────────────────────────────────
 .pytest_cache/

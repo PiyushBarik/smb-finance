@@ -1,3 +1,15 @@
+import sys
+
+# Ensure stdout/stderr can encode all UTF-8 characters (₹, em-dashes, etc.).
+# On Windows the default is cp1252 which raises UnicodeEncodeError whenever
+# SQLAlchemy echo=True or any logger emits a line containing ₹.
+# This must run before any logging configuration touches the streams.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler

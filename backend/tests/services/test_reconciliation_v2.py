@@ -1,7 +1,7 @@
 from datetime import date
 from types import SimpleNamespace
 
-from app.services.reconciliation_v2 import pass_exact
+from app.services.reconciliation_v2 import pass_exact, pass_fuzzy
 
 
 def _txn(id, amount, dt, description=""):
@@ -48,3 +48,41 @@ def test_pass_exact_defers_ambiguous_to_later_pass():
     assert matches == []
     assert len(unmatched_src) == 1
     assert len(unmatched_bank) == 2
+
+
+def test_pass_fuzzy_matches_within_two_percent_amount():
+    source = [_txn(1, -5000, date(2024, 4, 5), "Google Ads Campaign")]
+    bank   = [_txn(2,  5050, date(2024, 4, 5), "GOOGLE ADS DEBIT")]   # +1%
+
+    matches, _, _ = pass_fuzzy(source, bank)
+    assert len(matches) == 1
+    assert matches[0]["confidence"] == "medium"
+    assert matches[0]["pass_no"] == 2
+
+
+def test_pass_fuzzy_matches_within_three_day_window():
+    source = [_txn(1, -5000, date(2024, 4, 5), "Google Ads")]
+    bank   = [_txn(2,  5000, date(2024, 4, 8), "GOOGLE ADS DEBIT")]
+    matches, _, _ = pass_fuzzy(source, bank)
+    assert len(matches) == 1
+
+
+def test_pass_fuzzy_rejects_low_combined_score():
+    # Amount close but description has zero overlap and date 3 days off
+    source = [_txn(1, -5000, date(2024, 4, 5), "Salary Jane")]
+    bank   = [_txn(2,  5000, date(2024, 4, 8), "AWS Invoice")]
+    matches, unmatched_src, unmatched_bank = pass_fuzzy(source, bank)
+    assert matches == []
+    assert len(unmatched_src) == 1
+    assert len(unmatched_bank) == 1
+
+
+def test_pass_fuzzy_picks_best_score_when_multiple_candidates():
+    source = [_txn(1, -5000, date(2024, 4, 5), "Google Ads")]
+    bank   = [
+        _txn(2,  5000, date(2024, 4, 8), "Random thing"),   # date far, no overlap
+        _txn(3,  5050, date(2024, 4, 5), "GOOGLE ADS DEBIT"),  # close date + overlap
+    ]
+    matches, _, _ = pass_fuzzy(source, bank)
+    assert len(matches) == 1
+    assert matches[0]["bank_id"] == 3

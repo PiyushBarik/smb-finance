@@ -9,7 +9,7 @@ from app.core.config import settings
 from app.db.session import engine
 import app.db.base  # noqa
 from app.models.base import Base
-from app.api.routes import auth, orgs, transactions, invites, api_keys, audit, reports, billing
+from app.api.routes import auth, orgs, transactions, invites, api_keys, audit, reports, billing, reconcile_v2
 
 Base.metadata.create_all(bind=engine)
 
@@ -80,3 +80,4 @@ app.include_router(api_keys.router,     prefix="/api")
 app.include_router(audit.router,        prefix="/api")
 app.include_router(reports.router,      prefix="/api")
 app.include_router(billing.router,      prefix="/api")
+app.include_router(reconcile_v2.router, prefix="/api")

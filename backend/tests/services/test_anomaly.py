@@ -168,3 +168,44 @@ def test_refund_categorised_as_income_with_refund_keyword_required():
     ]
     anomalies = refund_without_charge(txns)
     assert anomalies == []
+
+
+from app.services.anomaly import detect
+
+
+def test_detect_runs_all_rules_and_returns_unique_anomalies():
+    # Construct data triggering vendor_spike and duplicate_within_window simultaneously
+    txns = []
+    # Build a vendor history (5 months with noise so stddev > 0 and spike fires)
+    history_amounts = [-1000, -950, -1100, -980, -1050]   # ~₹1000 + noise
+    for i, (amt, m) in enumerate(zip(history_amounts, range(11, 16)), start=1):
+        yy, mm = (2023, m) if m <= 12 else (2024, m - 12)
+        txns.append(SimpleNamespace(id=i, amount=amt, date=date(yy, mm, 15),
+                                    description="Google Ads", category="Advertising & Marketing",
+                                    gst_amount=None))
+    # April spike — two duplicates of ₹20,000 within 7 days
+    txns.append(SimpleNamespace(id=100, amount=-20000, date=date(2024, 4, 5),
+                                description="Google Ads", category="Advertising & Marketing", gst_amount=None))
+    txns.append(SimpleNamespace(id=101, amount=-20000, date=date(2024, 4, 8),
+                                description="Google Ads", category="Advertising & Marketing", gst_amount=None))
+
+    result = detect(txns, current_month=date(2024, 4, 1), as_of=date(2024, 4, 10))
+    rules_fired = {a["rule_id"] for a in result}
+    assert "vendor_spike" in rules_fired
+    assert "duplicate_within_window" in rules_fired
+
+
+def test_detect_dedups_by_evidence_hash_on_repeat_run():
+    txns = [
+        SimpleNamespace(id=1, amount=-15000, date=date(2024, 4, 16),
+                        description="Google Ads", category="Advertising & Marketing", gst_amount=None),
+        SimpleNamespace(id=2, amount=-15000, date=date(2024, 4, 17),
+                        description="Google Ads", category="Advertising & Marketing", gst_amount=None),
+    ]
+    r1 = detect(txns, current_month=date(2024, 4, 1), as_of=date(2024, 4, 20))
+    r2 = detect(txns, current_month=date(2024, 4, 1), as_of=date(2024, 4, 20))
+    # Each anomaly produces the same evidence_hash both times
+    from app.services.anomaly import evidence_hash
+    hashes_1 = {evidence_hash(a) for a in r1}
+    hashes_2 = {evidence_hash(a) for a in r2}
+    assert hashes_1 == hashes_2

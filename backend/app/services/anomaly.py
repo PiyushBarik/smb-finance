@@ -256,3 +256,31 @@ def refund_without_charge(
             },
         })
     return anomalies
+
+
+def detect(
+    transactions: list[Any],
+    current_month: date,
+    as_of: date,
+) -> list[dict]:
+    """Run all 5 rules and return their union. Each rule may throw — failures
+    are isolated; the others still run. Caller is responsible for persisting
+    and deduping via evidence_hash."""
+    all_anomalies: list[dict] = []
+
+    rule_fns = [
+        ("vendor_spike",            lambda t: vendor_spike(t, current_month=current_month)),
+        ("payout_cadence_gap",      lambda t: payout_cadence_gap(t, as_of=as_of)),
+        ("duplicate_within_window", lambda t: duplicate_within_window(t)),
+        ("gst_mismatch",            lambda t: gst_mismatch(t)),
+        ("refund_without_charge",   lambda t: refund_without_charge(t)),
+    ]
+
+    for rule_id, fn in rule_fns:
+        try:
+            all_anomalies.extend(fn(transactions))
+        except Exception as e:
+            # Rules are isolated; one failing rule does not stop the others.
+            print(f"[anomaly] rule {rule_id} failed: {e}")
+
+    return all_anomalies

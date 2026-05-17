@@ -108,3 +108,29 @@ def test_duplicate_ignores_different_vendor():
     ]
     anomalies = duplicate_within_window(txns)
     assert anomalies == []
+
+
+from app.services.anomaly import gst_mismatch
+
+
+def _gst_txn(id, amount, gst_amount):
+    return SimpleNamespace(id=id, amount=amount, gst_amount=gst_amount,
+                           date=date(2024, 4, 1), description="x", category="Software & Subscriptions")
+
+
+def test_gst_mismatch_flags_when_stored_diverges_from_recomputed():
+    # 1000 expense → expected GST = 1000 * 18/118 = 152.54
+    # Stored 200 → delta 47.46 → flag
+    txns = [_gst_txn(1, -1000, 200)]
+    anomalies = gst_mismatch(txns)
+    assert len(anomalies) == 1
+    d = anomalies[0]["detail"]
+    assert d["stored_gst"] == 200
+    assert abs(d["recomputed_gst"] - 152.54) < 0.01
+
+
+def test_gst_mismatch_silent_when_within_one_rupee():
+    # 1000 expense, stored 152.50 (≈152.54) → delta < 1 → no flag
+    txns = [_gst_txn(1, -1000, 152.50)]
+    anomalies = gst_mismatch(txns)
+    assert anomalies == []

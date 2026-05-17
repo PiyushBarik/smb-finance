@@ -187,3 +187,28 @@ def duplicate_within_window(
                 },
             })
     return anomalies
+
+
+def gst_mismatch(transactions: list[Any]) -> list[dict]:
+    """For expense txns with a stored gst_amount, recompute 18/118 and flag if diff > ₹1."""
+    anomalies: list[dict] = []
+    for t in transactions:
+        gst = getattr(t, "gst_amount", None)
+        if gst is None or t.amount >= 0:
+            continue
+        recomputed = round(abs(t.amount) * 18 / 118, 2)
+        delta = abs(gst - recomputed)
+        if delta <= 1.0:
+            continue
+        anomalies.append({
+            "rule_id":         "gst_mismatch",
+            "severity":        "low",
+            "transaction_ids": [t.id],
+            "detail": {
+                "txn_id":         t.id,
+                "stored_gst":     gst,
+                "recomputed_gst": recomputed,
+                "delta":          round(delta, 2),
+            },
+        })
+    return anomalies

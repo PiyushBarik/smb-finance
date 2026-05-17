@@ -1,269 +1,267 @@
 "use client";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { apiFetch } from "@/lib/api";
 import Nav from "@/components/Nav";
 import OrgSelector, { Org } from "@/components/OrgSelector";
-import { SourceBadge } from "@/components/Badge";
 import { useToast } from "@/components/Toast";
-import { GitMerge, CheckCircle2, XCircle, AlertCircle, Loader2, ChevronDown, ChevronUp } from "lucide-react";
+import {
+  RunDetail, RunSummary, MatchRow, AnomalyRow,
+  startRun, listRuns, getRun, scanAnomalies,
+} from "@/lib/reconcile";
+import { apiFetch } from "@/lib/api";
+import { LoadingState, EmptyState, ErrorState } from "@/components/reconcile/states";
+import { MatchCard } from "@/components/reconcile/MatchCard";
+import { AnomalyCard } from "@/components/reconcile/AnomalyCard";
+import { TriageColumn } from "@/components/reconcile/TriageColumn";
+import { RunHistoryStrip } from "@/components/reconcile/RunHistoryStrip";
+import { DrilldownDrawer } from "@/components/reconcile/DrilldownDrawer";
+import { Loader2, Play } from "lucide-react";
 
 interface Batch { id: number; filename: string; source: string; row_count: number; }
-interface ReconcileDetail {
-  status: "matched" | "unmatched_source" | "unmatched_bank";
-  source_id?: number; bank_id?: number;
-  amount: number;
-  source_desc?: string; bank_desc?: string;
-}
-interface ReconcileResult {
-  matched_pairs: number;
-  unmatched_source: number;
-  unmatched_bank: number;
-  match_rate: number;
-  details: ReconcileDetail[];
-}
 
 export default function ReconcilePage() {
   const router = useRouter();
   const { toast } = useToast();
 
-  const [org, setOrg]               = useState<Org | null>(null);
-  const [batches, setBatches]        = useState<Batch[]>([]);
-  const [sourceId, setSourceId]      = useState<number | "">("");
-  const [bankId, setBankId]          = useState<number | "">("");
-  const [loading, setLoading]        = useState(false);
-  const [result, setResult]          = useState<ReconcileResult | null>(null);
-  const [showDetails, setShowDetails] = useState(false);
+  const [org, setOrg] = useState<Org | null>(null);
+  const [batches, setBatches] = useState<Batch[]>([]);
+  const [sourceBatchId, setSourceBatchId] = useState<number | null>(null);
+  const [bankBatchId, setBankBatchId] = useState<number | null>(null);
 
-  useEffect(() => { if (!localStorage.getItem("smb_token")) router.push("/login"); }, []);
+  const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [currentRun, setCurrentRun] = useState<RunDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerKind, setDrawerKind] = useState<"match" | "anomaly" | null>(null);
+  const [drawerData, setDrawerData] = useState<MatchRow | AnomalyRow | null>(null);
+
+  useEffect(() => {
+    if (!localStorage.getItem("smb_token")) { router.push("/login"); return; }
+  }, []);
 
   useEffect(() => {
     if (!org) return;
-    setBatches([]); setSourceId(""); setBankId(""); setResult(null);
-    apiFetch<Batch[]>(`/transactions/batches/${org.id}`).then(setBatches);
+    apiFetch<Batch[]>(`/transactions/batches/${org.id}`).then(setBatches).catch(() => setBatches([]));
+    refreshRuns(org.id);
   }, [org]);
 
-  async function runReconcile() {
-    if (!org || !sourceId || !bankId) return;
-    if (sourceId === bankId) {
-      toast("Source and bank batches must be different", "error");
-      return;
-    }
-    setLoading(true); setResult(null);
+  async function refreshRuns(orgId: number) {
     try {
-      const r = await apiFetch<ReconcileResult>(
-        `/transactions/reconcile/${org.id}?source_batch_id=${sourceId}&bank_batch_id=${bankId}`,
-        { method: "POST" }
-      );
-      setResult(r);
-      toast(`Reconciliation complete — ${r.matched_pairs} matches found`, "success");
+      const list = await listRuns(orgId);
+      setRuns(list);
+      if (list.length > 0) {
+        const detail = await getRun(orgId, list[0].id);
+        setCurrentRun(detail);
+      } else {
+        setCurrentRun(null);
+      }
     } catch (e: unknown) {
-      toast(e instanceof Error ? e.message : "Reconciliation failed", "error");
-    } finally { setLoading(false); }
+      setError(e instanceof Error ? e.message : "Failed to load runs");
+    }
   }
 
-  const sourceBatches = batches.filter(b => b.id !== Number(bankId));
-  const bankBatches   = batches.filter(b => b.id !== Number(sourceId));
+  async function handleStart() {
+    if (!org || !sourceBatchId || !bankBatchId) return;
+    setStarting(true);
+    try {
+      const detail = await startRun(org.id, sourceBatchId, bankBatchId);
+      setCurrentRun(detail);
+      const list = await listRuns(org.id);
+      setRuns(list);
+      toast("Reconciliation complete", "success");
+    } catch (e: unknown) {
+      toast(e instanceof Error ? e.message : "Reconciliation failed", "error");
+    } finally {
+      setStarting(false);
+    }
+  }
 
-  const matched    = result?.details.filter(d => d.status === "matched")          ?? [];
-  const unmatchedS = result?.details.filter(d => d.status === "unmatched_source") ?? [];
-  const unmatchedB = result?.details.filter(d => d.status === "unmatched_bank")   ?? [];
+  async function handleSelectRun(runId: number) {
+    if (!org) return;
+    setLoading(true);
+    try {
+      const detail = await getRun(org.id, runId);
+      setCurrentRun(detail);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Failed to load run");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleScan() {
+    if (!org) return;
+    try {
+      const r = await scanAnomalies(org.id);
+      toast(`Scanned ${r.scanned} — ${r.new_anomalies} new anomalies`, "success");
+      await refreshRuns(org.id);
+    } catch (e: unknown) {
+      toast(e instanceof Error ? e.message : "Scan failed", "error");
+    }
+  }
+
+  function updateMatch(updated: MatchRow) {
+    setCurrentRun(r => r ? { ...r, matches: r.matches.map(m => m.id === updated.id ? updated : m) } : r);
+  }
+
+  function updateAnomaly(updated: AnomalyRow) {
+    setCurrentRun(r => r ? { ...r, anomalies: r.anomalies.map(a => a.id === updated.id ? updated : a) } : r);
+  }
+
+  function openDrilldown(kind: "match" | "anomaly", id: number) {
+    if (!currentRun) return;
+    const data = kind === "match"
+      ? currentRun.matches.find(m => m.id === id) ?? null
+      : currentRun.anomalies.find(a => a.id === id) ?? null;
+    setDrawerKind(kind);
+    setDrawerData(data);
+    setDrawerOpen(true);
+  }
+
+  const matches = currentRun?.matches ?? [];
+  const anomalies = currentRun?.anomalies ?? [];
+
+  const accepted   = matches.filter(m => m.status === "accepted");
+  const pending    = matches.filter(m => m.status === "pending" && m.confidence === "high");
+  const reviewable = matches.filter(m => m.status === "pending" && m.confidence !== "high");
+  const openAnomalies = anomalies.filter(a => a.status === "open");
 
   return (
-    <div className="min-h-screen bg-zinc-950">
+    <div style={{ minHeight: "100vh", background: "#0a0e1a", color: "#f8fafc",
+      fontFamily: "'Manrope', system-ui, sans-serif" }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');`}</style>
       <Nav />
-      <div className="mx-auto max-w-4xl px-4 md:px-6 py-6">
 
-        {/* Header */}
-        <div className="flex items-center justify-between mb-6 flex-wrap gap-3">
+      <div style={{ maxWidth: 1280, margin: "0 auto", padding: "36px 24px 60px" }}>
+        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between",
+          flexWrap: "wrap", gap: 16, marginBottom: 28 }}>
           <div>
-            <h1 className="text-xl font-bold">GST Reconciliation</h1>
-            <p className="text-xs text-zinc-500 mt-0.5">
-              Match your Shopify payouts against bank statements to spot discrepancies
+            <h1 style={{ fontFamily: "'Instrument Serif', Georgia, serif", fontSize: 36,
+              margin: "0 0 6px", lineHeight: 1 }}>
+              Reconcile <em style={{ color: "#475569" }}>triage</em>
+            </h1>
+            <p style={{ fontSize: 13, color: "#475569" }}>
+              Match Shopify payouts to bank credits, review anomalies, take action.
             </p>
           </div>
           <OrgSelector selected={org} onSelect={setOrg} />
         </div>
 
         {!org ? (
-          <div className="text-center py-20 text-zinc-500">Select an organisation to reconcile.</div>
-        ) : batches.length < 2 ? (
-          <div className="rounded-xl border border-dashed border-zinc-700 p-10 text-center">
-            <GitMerge size={36} className="mx-auto text-zinc-700 mb-3" />
-            <p className="text-zinc-400 mb-1">You need at least 2 upload batches to reconcile.</p>
-            <p className="text-xs text-zinc-600">Upload your Shopify CSV and bank statement CSV separately, then come back here.</p>
-          </div>
+          <EmptyState title="Pick an organisation" subtitle="Select one above to view reconciliations." />
         ) : (
           <>
-            {/* Batch selector */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-              {/* Source (Shopify) */}
-              <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
-                <p className="text-xs uppercase tracking-widest text-zinc-500 mb-3 font-semibold">Source (e.g. Shopify)</p>
-                <div className="space-y-2">
-                  {sourceBatches.map(b => (
-                    <label key={b.id} className={`flex items-center gap-3 rounded-lg border px-3 py-2.5 cursor-pointer transition-colors ${
-                      sourceId === b.id
-                        ? "border-emerald-600 bg-emerald-950/30"
-                        : "border-zinc-700 hover:border-zinc-500"
-                    }`}>
-                      <input
-                        type="radio"
-                        name="source"
-                        value={b.id}
-                        checked={sourceId === b.id}
-                        onChange={() => setSourceId(b.id)}
-                        className="accent-emerald-500"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm text-zinc-200 truncate">{b.filename}</p>
-                        <p className="text-xs text-zinc-500 mt-0.5">{b.row_count} transactions</p>
-                      </div>
-                      <SourceBadge source={b.source} />
-                    </label>
-                  ))}
-                </div>
-              </div>
-
-              {/* Bank */}
-              <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
-                <p className="text-xs uppercase tracking-widest text-zinc-500 mb-3 font-semibold">Bank Statement</p>
-                <div className="space-y-2">
-                  {bankBatches.map(b => (
-                    <label key={b.id} className={`flex items-center gap-3 rounded-lg border px-3 py-2.5 cursor-pointer transition-colors ${
-                      bankId === b.id
-                        ? "border-sky-600 bg-sky-950/30"
-                        : "border-zinc-700 hover:border-zinc-500"
-                    }`}>
-                      <input
-                        type="radio"
-                        name="bank"
-                        value={b.id}
-                        checked={bankId === b.id}
-                        onChange={() => setBankId(b.id)}
-                        className="accent-sky-500"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm text-zinc-200 truncate">{b.filename}</p>
-                        <p className="text-xs text-zinc-500 mt-0.5">{b.row_count} transactions</p>
-                      </div>
-                      <SourceBadge source={b.source} />
-                    </label>
-                  ))}
-                </div>
-              </div>
+            {/* Run-start form */}
+            <div style={{
+              padding: 18, borderRadius: 14,
+              border: "1px solid rgba(30,41,59,0.7)",
+              background: "rgba(15,23,42,0.4)",
+              display: "flex", alignItems: "center", gap: 12,
+              flexWrap: "wrap", marginBottom: 24,
+            }}>
+              <select
+                value={sourceBatchId ?? ""}
+                onChange={e => setSourceBatchId(Number(e.target.value) || null)}
+                style={selectStyle}
+              >
+                <option value="">Source batch (Shopify…)</option>
+                {batches.filter(b => b.source !== "bank").map(b => (
+                  <option key={b.id} value={b.id}>{b.filename} ({b.row_count} rows)</option>
+                ))}
+              </select>
+              <select
+                value={bankBatchId ?? ""}
+                onChange={e => setBankBatchId(Number(e.target.value) || null)}
+                style={selectStyle}
+              >
+                <option value="">Bank batch</option>
+                {batches.filter(b => b.source === "bank").map(b => (
+                  <option key={b.id} value={b.id}>{b.filename} ({b.row_count} rows)</option>
+                ))}
+              </select>
+              <button
+                onClick={handleStart}
+                disabled={!sourceBatchId || !bankBatchId || starting}
+                style={primaryBtn(starting)}
+              >
+                {starting ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+                Run reconciliation
+              </button>
+              <button onClick={handleScan} style={ghostBtn}>
+                Rescan anomalies
+              </button>
             </div>
 
-            <button
-              onClick={runReconcile}
-              disabled={!sourceId || !bankId || loading}
-              className="w-full flex items-center justify-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-zinc-950 font-semibold py-3 transition-colors"
-            >
-              {loading
-                ? <><Loader2 size={16} className="animate-spin" /> Running reconciliation…</>
-                : <><GitMerge size={16} /> Run Reconciliation</>
-              }
-            </button>
+            <RunHistoryStrip runs={runs} selectedRunId={currentRun?.id ?? null} onSelect={handleSelectRun} />
 
-            {/* Results */}
-            {result && (
-              <div className="mt-6 space-y-4">
-                {/* Score cards */}
-                <div className="grid grid-cols-3 gap-3">
-                  <div className="rounded-xl border border-emerald-800 bg-emerald-950/30 p-4 text-center">
-                    <CheckCircle2 size={20} className="mx-auto text-emerald-400 mb-2" />
-                    <p className="text-2xl font-bold text-emerald-400">{result.matched_pairs}</p>
-                    <p className="text-xs text-zinc-500 mt-0.5">Matched</p>
-                  </div>
-                  <div className="rounded-xl border border-red-800 bg-red-950/30 p-4 text-center">
-                    <XCircle size={20} className="mx-auto text-red-400 mb-2" />
-                    <p className="text-2xl font-bold text-red-400">{result.unmatched_source}</p>
-                    <p className="text-xs text-zinc-500 mt-0.5">Unmatched Source</p>
-                  </div>
-                  <div className="rounded-xl border border-amber-800 bg-amber-950/30 p-4 text-center">
-                    <AlertCircle size={20} className="mx-auto text-amber-400 mb-2" />
-                    <p className="text-2xl font-bold text-amber-400">{result.unmatched_bank}</p>
-                    <p className="text-xs text-zinc-500 mt-0.5">Unmatched Bank</p>
-                  </div>
-                </div>
+            {loading && <LoadingState />}
+            {error && <ErrorState message={error} onRetry={() => org && refreshRuns(org.id)} />}
 
-                {/* Match rate bar */}
-                <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-sm font-semibold">Match Rate</span>
-                    <span className={`text-xl font-bold ${result.match_rate >= 80 ? "text-emerald-400" : result.match_rate >= 50 ? "text-amber-400" : "text-red-400"}`}>
-                      {result.match_rate}%
-                    </span>
-                  </div>
-                  <div className="h-2 rounded-full bg-zinc-800">
-                    <div
-                      className={`h-2 rounded-full transition-all ${result.match_rate >= 80 ? "bg-emerald-500" : result.match_rate >= 50 ? "bg-amber-500" : "bg-red-500"}`}
-                      style={{ width: `${result.match_rate}%` }}
-                    />
-                  </div>
-                  <p className="text-xs text-zinc-500 mt-2">
-                    {result.match_rate >= 80
-                      ? "Excellent — most transactions reconciled successfully."
-                      : result.match_rate >= 50
-                      ? "Partial match — review unmatched items below."
-                      : "Low match rate — check for date mismatches or different amount formats."}
-                  </p>
-                </div>
+            {!loading && !error && !currentRun && (
+              <EmptyState title="No reconciliations yet" subtitle="Start one above to begin." />
+            )}
 
-                {/* Detail toggle */}
-                <button
-                  onClick={() => setShowDetails(d => !d)}
-                  className="flex items-center gap-2 text-sm text-zinc-400 hover:text-white transition-colors"
-                >
-                  {showDetails ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
-                  {showDetails ? "Hide" : "Show"} match details ({result.details.length} rows)
-                </button>
+            {!loading && !error && currentRun && (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 24 }}>
+                <TriageColumn title="Auto-matched" count={accepted.length + pending.length} accent="emerald" defaultCollapsed>
+                  {[...pending, ...accepted].map(m => (
+                    <MatchCard key={m.id} match={m} onChange={updateMatch}
+                      onOpenDrilldown={id => openDrilldown("match", id)} />
+                  ))}
+                </TriageColumn>
 
-                {showDetails && (
-                  <div className="rounded-xl border border-zinc-800 overflow-x-auto">
-                    <table className="w-full text-xs min-w-[600px]">
-                      <thead className="border-b border-zinc-800 bg-zinc-900/60">
-                        <tr>
-                          <th className="px-4 py-2.5 text-left text-zinc-400">Status</th>
-                          <th className="px-4 py-2.5 text-left text-zinc-400">Source Description</th>
-                          <th className="px-4 py-2.5 text-left text-zinc-400">Bank Description</th>
-                          <th className="px-4 py-2.5 text-right text-zinc-400">Amount</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-zinc-800/50">
-                        {matched.map((d, i) => (
-                          <tr key={i} className="bg-emerald-950/10">
-                            <td className="px-4 py-2"><span className="text-emerald-400">✓ Matched</span></td>
-                            <td className="px-4 py-2 text-zinc-400 truncate max-w-[180px]">{d.source_desc || "—"}</td>
-                            <td className="px-4 py-2 text-zinc-400 truncate max-w-[180px]">{d.bank_desc || "—"}</td>
-                            <td className="px-4 py-2 text-right font-mono text-zinc-300">₹{Math.abs(d.amount).toLocaleString("en-IN")}</td>
-                          </tr>
-                        ))}
-                        {unmatchedS.map((d, i) => (
-                          <tr key={`s${i}`} className="bg-red-950/10">
-                            <td className="px-4 py-2"><span className="text-red-400">✗ No bank entry</span></td>
-                            <td className="px-4 py-2 text-zinc-400">{d.source_desc || "—"}</td>
-                            <td className="px-4 py-2 text-zinc-600">—</td>
-                            <td className="px-4 py-2 text-right font-mono text-zinc-300">₹{Math.abs(d.amount).toLocaleString("en-IN")}</td>
-                          </tr>
-                        ))}
-                        {unmatchedB.map((d, i) => (
-                          <tr key={`b${i}`} className="bg-amber-950/10">
-                            <td className="px-4 py-2"><span className="text-amber-400">? Bank only</span></td>
-                            <td className="px-4 py-2 text-zinc-600">—</td>
-                            <td className="px-4 py-2 text-zinc-400">{d.bank_desc || "—"}</td>
-                            <td className="px-4 py-2 text-right font-mono text-zinc-300">₹{Math.abs(d.amount).toLocaleString("en-IN")}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
+                <TriageColumn title="Needs review" count={reviewable.length} accent="amber">
+                  {reviewable.length === 0
+                    ? <EmptyState title="Nothing to review" />
+                    : reviewable.map(m => (
+                        <MatchCard key={m.id} match={m} onChange={updateMatch}
+                          onOpenDrilldown={id => openDrilldown("match", id)} />
+                      ))}
+                </TriageColumn>
+
+                <TriageColumn title="Anomalies" count={openAnomalies.length} accent="rose">
+                  {openAnomalies.length === 0
+                    ? <EmptyState title="No open anomalies" />
+                    : openAnomalies.map(a => (
+                        <AnomalyCard key={a.id} anomaly={a} onChange={updateAnomaly}
+                          onOpenDrilldown={id => openDrilldown("anomaly", id)} />
+                      ))}
+                </TriageColumn>
               </div>
             )}
           </>
         )}
       </div>
+
+      <DrilldownDrawer
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        kind={drawerKind}
+        data={drawerData}
+      />
     </div>
   );
 }
+
+const selectStyle: React.CSSProperties = {
+  padding: "8px 12px", borderRadius: 8,
+  border: "1px solid rgba(30,41,59,0.8)",
+  background: "rgba(15,23,42,0.7)", color: "#e2e8f0",
+  fontSize: 13, fontFamily: "inherit", minWidth: 220,
+};
+
+const primaryBtn = (busy: boolean): React.CSSProperties => ({
+  display: "flex", alignItems: "center", gap: 6,
+  padding: "8px 14px", borderRadius: 8, border: "none", cursor: busy ? "wait" : "pointer",
+  background: "#34d399", color: "#0f172a", fontSize: 13, fontWeight: 700,
+  fontFamily: "inherit", opacity: busy ? 0.6 : 1,
+});
+
+const ghostBtn: React.CSSProperties = {
+  padding: "8px 14px", borderRadius: 8,
+  border: "1px solid rgba(30,41,59,0.8)", background: "transparent",
+  color: "#94a3b8", fontSize: 12, cursor: "pointer", fontFamily: "inherit",
+};

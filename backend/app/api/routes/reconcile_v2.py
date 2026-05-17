@@ -194,3 +194,80 @@ def get_run(
     anomalies = db.query(Anomaly).filter(Anomaly.org_id == org_id, Anomaly.status != "dismissed") \
                                  .order_by(Anomaly.detected_at.desc()).limit(50).all()
     return _run_detail_dict(run, matches, anomalies)
+
+
+@router.patch("/matches/{match_id}", response_model=MatchOut)
+def patch_match(
+    match_id: int,
+    payload: PatchMatchRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    m_row = db.query(Match).filter(Match.id == match_id).first()
+    if not m_row:
+        raise HTTPException(404, "Match not found")
+    run = db.query(ReconciliationRun).filter(ReconciliationRun.id == m_row.run_id).first()
+    membership = check_org_membership(run.org_id, current_user, db)
+    if membership.role not in WRITE_ROLES:
+        raise HTTPException(403, "Viewers cannot triage matches")
+    m_row.status = payload.status
+    db.commit()
+    db.refresh(m_row)
+    return m_row
+
+
+@router.patch("/anomalies/{anomaly_id}", response_model=AnomalyOut)
+def patch_anomaly(
+    anomaly_id: int,
+    payload: PatchAnomalyRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    a = db.query(Anomaly).filter(Anomaly.id == anomaly_id).first()
+    if not a:
+        raise HTTPException(404, "Anomaly not found")
+    membership = check_org_membership(a.org_id, current_user, db)
+    if membership.role not in WRITE_ROLES:
+        raise HTTPException(403, "Viewers cannot triage anomalies")
+    a.status = payload.status
+    a.snoozed_until = payload.snoozed_until
+    db.commit()
+    db.refresh(a)
+    return AnomalyOut(
+        id=a.id, rule_id=a.rule_id, severity=a.severity,
+        transaction_ids=json.loads(a.transaction_ids),
+        detail=json.loads(a.detail),
+        explanation=a.explanation, status=a.status,
+        snoozed_until=a.snoozed_until,
+        detected_at=a.detected_at, updated_at=a.updated_at,
+    )
+
+
+@router.post("/anomalies/{org_id}/scan")
+def scan_anomalies(
+    org_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    m = check_org_membership(org_id, current_user, db)
+    if m.role not in WRITE_ROLES:
+        raise HTTPException(403, "Viewers cannot trigger scans")
+
+    all_org_txns = db.query(Transaction).filter(Transaction.org_id == org_id).all()
+    detected = detect(all_org_txns, current_month=date.today().replace(day=1), as_of=date.today())
+
+    new_count = 0
+    for a in detected:
+        h = evidence_hash(a)
+        if db.query(Anomaly).filter(Anomaly.evidence_hash == h).first():
+            continue
+        explanation = explain_anomaly(a)
+        db.add(Anomaly(
+            org_id=org_id, rule_id=a["rule_id"], severity=a["severity"],
+            transaction_ids=json.dumps(a["transaction_ids"]),
+            detail=json.dumps(a["detail"], default=str),
+            explanation=explanation, evidence_hash=h,
+        ))
+        new_count += 1
+    db.commit()
+    return {"new_anomalies": new_count, "scanned": len(detected)}

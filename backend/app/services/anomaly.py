@@ -212,3 +212,47 @@ def gst_mismatch(transactions: list[Any]) -> list[dict]:
             },
         })
     return anomalies
+
+
+_REFUND_PATTERN = re.compile(r"\brefund\b", re.IGNORECASE)
+
+
+def refund_without_charge(
+    transactions: list[Any],
+    lookback_days: int = 60,
+) -> list[dict]:
+    """Positive refund-like txn with no matching prior negative same-vendor txn within window."""
+    anomalies: list[dict] = []
+    refunds = [
+        t for t in transactions
+        if t.amount > 0
+        and t.date
+        and t.description
+        and _REFUND_PATTERN.search(t.description)
+    ]
+    for r in refunds:
+        r_vendor = _vendor_key(r.description)
+        r_amt = r.amount
+        prior = [
+            t for t in transactions
+            if t.amount < 0
+            and t.date
+            and (r.date - t.date).days >= 0
+            and (r.date - t.date).days <= lookback_days
+            and _vendor_key(t.description) == r_vendor
+            and abs(abs(t.amount) - r_amt) <= max(2.0, r_amt * 0.02)
+        ]
+        if prior:
+            continue
+        anomalies.append({
+            "rule_id":         "refund_without_charge",
+            "severity":        "medium",
+            "transaction_ids": [r.id],
+            "detail": {
+                "refund_txn_id":         r.id,
+                "amount":                r_amt,
+                "vendor":                r_vendor,
+                "searched_window_days":  lookback_days,
+            },
+        })
+    return anomalies

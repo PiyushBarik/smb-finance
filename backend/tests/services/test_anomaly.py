@@ -134,3 +134,37 @@ def test_gst_mismatch_silent_when_within_one_rupee():
     txns = [_gst_txn(1, -1000, 152.50)]
     anomalies = gst_mismatch(txns)
     assert anomalies == []
+
+
+from app.services.anomaly import refund_without_charge
+
+
+def test_refund_without_prior_charge_is_flagged():
+    txns = [
+        SimpleNamespace(id=1, amount=2500, date=date(2024, 4, 20),
+                        description="REFUND CUSTOMER ABC", category="Income / Revenue", gst_amount=None),
+    ]
+    anomalies = refund_without_charge(txns)
+    assert len(anomalies) == 1
+    assert anomalies[0]["detail"]["amount"] == 2500
+
+
+def test_refund_with_matching_prior_charge_is_not_flagged():
+    txns = [
+        SimpleNamespace(id=1, amount=-2500, date=date(2024, 3, 1),
+                        description="ABC CUSTOMER ORDER", category="Inventory & COGS", gst_amount=None),
+        SimpleNamespace(id=2, amount=2500, date=date(2024, 4, 20),
+                        description="REFUND CUSTOMER ABC", category="Income / Revenue", gst_amount=None),
+    ]
+    anomalies = refund_without_charge(txns)
+    assert anomalies == []
+
+
+def test_refund_categorised_as_income_with_refund_keyword_required():
+    # No "refund" keyword in description → not flagged as a refund
+    txns = [
+        SimpleNamespace(id=1, amount=2500, date=date(2024, 4, 20),
+                        description="Some sale", category="Income / Revenue", gst_amount=None),
+    ]
+    anomalies = refund_without_charge(txns)
+    assert anomalies == []
